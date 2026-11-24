@@ -1,0 +1,114 @@
+name: Build STUDIO BHARAT X APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unzip Project If Present
+        run: |
+          if ls *.zip 1> /dev/null 2>&1; then unzip -o "*.zip"; fi
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install & Build Web App
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+
+      - name: Setup Capacitor 8 Android
+        run: |
+          npm install --legacy-peer-deps @capacitor/core@8 @capacitor/cli@8 @capacitor/android@8 @capacitor-community/text-to-speech@8
+          npx cap add android || true
+          npx cap sync android
+
+      - name: Inject VedaAgent Native Plugin + Accessibility Service
+        run: |
+          set -e
+          PKG_PATH="android/app/src/main/java/com/studiobharatx/veda"
+          RES_XML="android/app/src/main/res/xml"
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          STRINGS="android/app/src/main/res/values/strings.xml"
+
+          mkdir -p "$PKG_PATH"
+          mkdir -p "$RES_XML"
+
+          if [ -d "android-native" ]; then
+            cp -f android-native/VedaAgentPlugin.kt "$PKG_PATH/"
+            cp -f android-native/VedaAccessibilityService.kt "$PKG_PATH/"
+            cp -f android-native/TopCapsuleService.kt "$PKG_PATH/"
+            cp -f android-native/accessibility_service_config.xml "$RES_XML/"
+            echo "Copied VedaAgent native sources"
+          else
+            echo "WARNING: android-native folder missing"
+          fi
+
+          if [ -f "$STRINGS" ]; then
+            if ! grep -q "accessibility_service_description" "$STRINGS"; then
+              sed -i 's|</resources>|    <string name="accessibility_service_description">STUDIO BHARAT X needs Accessibility to open apps, swipe, read screen and control phone for VEDA Agent.</string>\n</resources>|' "$STRINGS"
+            fi
+          fi
+
+          grep -q "RECORD_AUDIO" "$MANIFEST" || sed -i 's|<application|<uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n    <uses-permission android:name="android.permission.WRITE_SETTINGS" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <application|' "$MANIFEST"
+
+          if ! grep -q "VedaAccessibilityService" "$MANIFEST"; then
+            python3 - << 'PY'
+import pathlib
+manifest = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+text = manifest.read_text(encoding="utf-8")
+service_block = """
+        <service
+            android:name="com.studiobharatx.veda.VedaAccessibilityService"
+            android:exported="false"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+        <service
+            android:name="com.studiobharatx.veda.TopCapsuleService"
+            android:exported="false" />
+"""
+if "</application>" in text and "VedaAccessibilityService" not in text:
+    text = text.replace("</application>", service_block + "\n    </application>")
+    manifest.write_text(text, encoding="utf-8")
+    print("Registered VedaAccessibilityService + TopCapsuleService in Manifest")
+else:
+    print("Services already present or no </application> tag")
+PY
+          fi
+
+          echo "=== Native injection complete ==="
+          ls -la "$PKG_PATH" || true
+
+      - name: Build Debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-bharat-x-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
